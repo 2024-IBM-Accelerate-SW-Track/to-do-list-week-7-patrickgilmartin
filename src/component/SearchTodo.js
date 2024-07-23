@@ -1,69 +1,56 @@
-import React, { Component } from "react";
+import React, { useState } from "react";
 import { Button, TextField } from "@mui/material";
 import Axios from "axios";
 
-class SearchTodo extends Component {
-  
-  state = {
-    tmpdata: [],
+const SearchTodo = () => {
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState([]);
+
+  const handleChange = (e) => {
+    setQuery(e.target.value);
   };
 
-  handleChange = (e) => {
-    this.setState({
-      content: e.target.value,
-      date: Date().toLocaleString('en-US'),
-    });
-  };
-  
-
-  handleSubmit = (e) => {
-    //Begin Here
-    e.preventDefault();  
-    // HTTP Client to send a GET request
-    Axios({
-      method: "GET",
-      url: "http://localhost:8080/items/search",
-      headers: {
-        "Content-Type": "application/json" 
-      },
-      params: {
-        taskname: this.state.content
-      }
-    }).then(res => {
-      this.setState({
-        tmpdata: JSON.stringify(res.data),
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    try {
+      const response = await Axios.get(`http://localhost:3000/get/searchitem`, {
+        params: { taskname: query },
+        withCredentials: true
       });
-      // uncomment to see from the browser console log what is returned 
-      //console.log(this.state.tmpdata);
-    });
+      setResults(response.data.filter(todo => !todo.completed)); // Show only active todos
+    } catch (error) {
+      console.error("Error searching items", error);
+    }
   };
-  
-  render() {
-    return (
+
+  return (
+    <div>
+      <form onSubmit={handleSubmit}>
+        <TextField
+          label="Search for ToDo Item"
+          variant="outlined"
+          onChange={handleChange}
+          value={query}
+        />
+        <Button
+          style={{ marginLeft: "10px", marginTop: 10 }}
+          variant="contained"
+          color="primary"
+          type="submit"
+        >
+          Search
+        </Button>
+      </form>
       <div>
-        <form onSubmit={this.handleSubmit}>
-          <TextField
-            id="search-item-input"
-            label="Search for ToDo Item"
-            variant="outlined"
-            onChange={this.handleChange}
-            value={this.state.value}
-          /> 
-          <Button
-            id="search-item-button"
-            name='submit'
-            style={{ marginLeft: "10px",marginTop:10 }}
-            onClick={this.handleSubmit}
-            variant="contained"
-            color="primary"
-          >
-            Search
-          </Button>
-        </form>
-        <div>{this.state.tmpdata}</div>
+        {results.map((result) => (
+          <div key={result.ID}>
+            <h3>{result.Task}</h3>
+            <p>{result.Current_date} - {result.Due_date}</p>
+          </div>
+        ))}
       </div>
-    );
-  }
-}
+    </div>
+  );
+};
 
 export default SearchTodo;

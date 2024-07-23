@@ -1,164 +1,225 @@
-const express = require("express"),
-       app = express(),
-       port = process.env.PORT || 8080,
-       cors = require("cors");
+const express = require("express");
+const app = express();
+const cors = require("cors");
 const bodyParser = require('body-parser');
 const fsPromises = require("fs").promises;
-//const fs = require("fs");
+const moment = require("moment");
+const basicAuth = require("express-basic-auth");
+const cookieParser = require("cookie-parser");
+const { CloudantV1 } = require('@ibm-cloud/cloudant');
+const { authenticator, upsertUser, cookieAuth } = require("./authentication");
+
 const todoDBName = "tododb";
 const useCloudant = true;
 
-
-
-//Init code for Cloudant
-const {CloudantV1} = require('@ibm-cloud/cloudant');
-if (useCloudant)
-{
+if (useCloudant) {
     initDB();
 }
 
-
-app.use(cors());
+app.use(cors({
+    credentials: true,
+    origin: 'http://localhost:3000'
+}));
+app.use(express.json());
 app.use(bodyParser.json({ extended: true }));
+app.use(cookieParser("82e4e438a0705fabf61f9854e3b575af"));
 
-app.listen(port, () => console.log("Backend server live on " + port));
+function startServer(port) {
+  app.listen(port, () => {
+    console.log(`Server running on port ${port}`);
+  }).on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.log(`Port ${port} is busy, trying ${port + 1}`);
+      startServer(port + 1);
+    } else {
+      console.error(err);
+    }
+  });
+}
 
-
-
-app.get("/", (request, response) => {
-    response.send({ message: "Connected to Backend server!" });
+app.get("/", (req, res) => {
+  res.send({ message: "Connected to Backend server!" });
 });
 
-//add new item to json file
-app.post("/add/item", addItem)
+// Add authentication endpoints
+app.get("/authenticate", basicAuth({ authorizer: authenticator }), (req, res) => {
+    console.log(`user logging in: ${req.auth.user}`);
+    res.cookie('user', req.auth.user, { signed: true });
+    res.sendStatus(200);
+});
 
-async function addItem (request, response) {
+app.post("/users", (req, res) => {
+    const b64auth = (req.headers.authorization || '').split(' ')[1] || ''
+    const [username, password] = Buffer.from(b64auth, 'base64').toString().split(':')
+    const upsertSucceeded = upsertUser(username, password)
+    res.sendStatus(upsertSucceeded ? 200 : 401);
+});
+
+app.get("/logout", (req, res) => {
+    res.clearCookie('user');
+    res.end();
+});
+
+app.post("/add/item", cookieAuth, async (req, res) => {
     try {
-        // Converting Javascript object (Task Item) to a JSON string
-        const id = request.body.jsonObject.id
-        const task = request.body.jsonObject.task
-        const curDate = request.body.jsonObject.currentDate
-        const dueDate = request.body.jsonObject.dueDate
+        const { id, task, currentDate, dueDate, eventType } = req.body.jsonObject;
+
+        if (!id || !task || !currentDate || !dueDate || !eventType) {
+            return res.status(400).json({ error: "All fields are required" });
+        }
+
         const newTask = {
           ID: id,
           Task: task,
-          Current_date: curDate,
-          Due_date: dueDate
-        }
-        
-        if (useCloudant) {
-            //begin here for cloudant
-            //const todoDocID = id;
+          Current_date: moment(currentDate).toISOString(),
+          Due_date: moment(dueDate, ["MM/DD/YYYY", "DD/MM/YYYY", "YYYY-MM-DD"]).format("MM/DD/YYYY"), // Ensure MM/DD/YYYY format
+          Event_type: eventType,
+          completed: false // Add completed field
+        };
 
-            // Setting `_id` for the document is optional when "postDocument" function is used for CREATE.
-            // When `_id` is not provided the server will generate one for your document.
-            const todoDocument = { _id: id.stringify };
-          
-            // Add "name" and "joined" fields to the document
-            todoDocument['task'] = task;
-            todoDocument.curDate = curDate;
-            todoDocument.dueDate = dueDate;
-          
-            // Save the document in the database with "postDocument" function
+        if (!moment(newTask.Due_date, "MM/DD/YYYY", true).isValid()) {
+            return res.status(400).json({ error: "Invalid date format" });
+        }
+
+        if (useCloudant) {
             const client = CloudantV1.newInstance({});
-            console.log('Writing to: ', todoDBName)
-            const createDocumentResponse = await client.postDocument({
-              db: todoDBName,
-              document: todoDocument,
-            });
+            const todoDocument = { _id: id.toString(), task, curDate: currentDate, dueDate };
+            await client.postDocument({ db: todoDBName, document: todoDocument });
             console.log('Successfully wrote to cloudant DB');
         } else {
-            //original write to local file
             const data = await fsPromises.readFile("database.json");
             const json = JSON.parse(data);
             json.push(newTask);
-            await fsPromises.writeFile("database.json", JSON.stringify(json))
-            console.log('Successfully wrote to file') 
+            await fsPromises.writeFile("database.json", JSON.stringify(json));
+            console.log('Successfully wrote to file');
         }
-        response.sendStatus(200)
+        res.sendStatus(200);
     } catch (err) {
-        console.log("error: ", err)
-        response.sendStatus(500)
+        console.error("Error:", err);
+        res.status(500).json({ error: "Internal Server Error" });
+    }
+});
+
+app.post("/add/items", cookieAuth, async (req, res) => {
+  try {
+    const { todos } = req.body;
+
+    if (!Array.isArray(todos) || todos.length === 0) {
+      return res.status(400).json({ error: "Invalid or empty todos array" });
+    }
+
+    const data = await fsPromises.readFile("database.json");
+    let json = JSON.parse(data);
+
+    const newTodos = todos.map(todo => {
+      const parsedDueDate = moment(todo.dueDate, ["MM/DD/YYYY", "DD/MM/YYYY", "YYYY-MM-DD", "M/D/YYYY", "D/M/YYYY"], true);
+
+      if (!parsedDueDate.isValid()) {
+        console.warn(`Invalid date for todo: ${todo.task}`);
+        return null;
+      }
+
+      return {
+        ID: todo.id,
+        Task: todo.task,
+        Current_date: todo.currentDate,
+        Due_date: parsedDueDate.format("MM/DD/YYYY"),
+        Event_type: todo.eventType,
+        completed: false // Add completed field
+      };
+    }).filter(todo => todo !== null);
+
+    json = json.concat(newTodos);
+    await fsPromises.writeFile("database.json", JSON.stringify(json));
+
+    res.status(200).json({ 
+      message: "Todos added successfully", 
+      addedCount: newTodos.length 
+    });
+  } catch (err) {
+    console.error("Error:", err);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+app.get("/get/items", cookieAuth, async (req, res) => {
+  try {
+    if (useCloudant) {
+        const client = CloudantV1.newInstance({});
+        const listofdocs = (await client.postAllDocs({ db: todoDBName, includeDocs: true })).result;
+        res.json(JSON.stringify(listofdocs));
+    } else {
+        const data = await fsPromises.readFile("database.json");
+        res.json(JSON.parse(data));
+    }
+  } catch (err) {
+    console.error("Error:", err);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+app.get("/get/searchitem", cookieAuth, async (req, res) => {
+  try {
+    const searchField = req.query.taskname;
+    if (useCloudant) {
+        const client = CloudantV1.newInstance({});
+        const search_results = (await client.postSearch({ db: todoDBName, ddoc: 'newdesign', query: 'task:' + searchField, index: 'newSearch' })).result;
+        console.log(search_results);
+        res.json(JSON.stringify(search_results));
+    } else {
+        const json = JSON.parse(await fsPromises.readFile("database.json"));
+        const returnData = json.filter(jsondata => jsondata.Task === searchField);
+        res.json(returnData);
+    }
+  } catch (err) {
+    console.error("Error:", err);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+app.delete("/delete/item/:id", cookieAuth, async (req, res) => {
+  try {
+    const id = parseFloat(req.params.id);
+    const data = await fsPromises.readFile("database.json");
+    const json = JSON.parse(data);
+    const newJson = json.filter((todo) => todo.ID !== id);
+    await fsPromises.writeFile("database.json", JSON.stringify(newJson));
+    res.sendStatus(200);
+  } catch (err) {
+    console.log("Error:", err);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+app.put("/complete/item/:id", cookieAuth, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const data = await fsPromises.readFile("database.json");
+    const todos = JSON.parse(data);
+    const updatedTodos = todos.map(todo => {
+      if (todo.ID.toString() === id) {  // Convert ID to string for comparison
+        return { ...todo, completed: true };
+      }
+      return todo;
+    });
+    await fsPromises.writeFile("database.json", JSON.stringify(updatedTodos));
+    res.sendStatus(200);
+  } catch (err) {
+    console.log("Error:", err);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+async function initDB() {
+    try {
+        const client = CloudantV1.newInstance({});
+        const putDatabaseResult = (await client.putDatabase({ db: todoDBName })).result;
+        if (putDatabaseResult.ok) {
+            console.log(`"${todoDBName}" database created.`);
+        }
+    } catch (err) {
+        console.log(`Cannot create "${todoDBName}" database, err: "${err.message}".`);
     }
 }
 
-//** week 6, get all items from the json database*/
-app.get("/get/items", getItems)
-async function getItems (request, response) {
-    //begin here
-
-    //begin cloudant here
-    if (useCloudant) {
-    //add for cloudant client
-    const client = CloudantV1.newInstance({});
-    var listofdocs;
-    await client.postAllDocs({
-        db: todoDBName,
-        includeDocs: true
-    }).then(response => {
-        listofdocs=response.result;
-        });
-    response.json(JSON.stringify(listofdocs));
-    }
-    else {
-    //for non-cloudant use-case
-    var data = await fsPromises.readFile("database.json");
-    response.json(JSON.parse(data));
-    }
-
-};
-
-//** week 6, search items service */
-app.get("/get/searchitem", searchItems) 
-async function searchItems (request, response) {
-    //begin here
-    var searchField = request.query.taskname;
-
-    if (useCloudant){
-        const client = CloudantV1.newInstance({});
-        var search_results
-        await client.postSearch({
-            db: todoDBName,
-            ddoc: 'newdesign',
-            query: 'task:'+searchField,
-            index: 'newSearch'
-          }).then(response => {
-            search_results=response.result;
-            console.log(response.result);
-          });
-        console.log(search_results);
-        response.json(JSON.stringify(search_results));
-        
-    }
-    else {
-    var json = JSON.parse (await fsPromises.readFile("database.json"));
-    var returnData = json.filter(jsondata => jsondata.Task === searchField);
-    response.json(returnData);
-    }
-};
-
-
-// Add initDB function here
-async function initDB ()
-{
-    //TODO --- Insert to create DB
-    //See example at https://www.npmjs.com/package/@ibm-cloud/cloudant#authentication-with-environment-variables for how to create db
-    
-    try {
-        const client = CloudantV1.newInstance({});
-        const putDatabaseResult = (
-        await client.putDatabase({
-        db: todoDBName,
-      })
-    ).result;
-    if (putDatabaseResult.ok) {
-      console.log(`"${todoDBName}" database created.`);
-    }
-  } catch (err) {
-   
-      console.log(
-        `Cannot create "${todoDBName}" database, err: "${err.message}".`
-      );
-
-  }
-};
+startServer(5000); // Start the server on port 5000

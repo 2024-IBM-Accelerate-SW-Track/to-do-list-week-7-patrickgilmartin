@@ -4,7 +4,6 @@ import "../pages/TodoPage.css";
 import ShowTodos from "../component/TodoData";
 
 export default class TodoPage extends Component {
-
      render() { 
       return (
         <div className="Todo List">
@@ -14,8 +13,4 @@ export default class TodoPage extends Component {
         </div>
       );
   }
-
 }
-
-  
-
